@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ $# -ne 1 || ! -s "$1" ]]; then
+    echo "Usage: magiskroot boot.img"
+    exit 1
+fi
+
+INPUT="$(realpath "$1")"
+DIR="$(dirname "$INPUT")"
+NAME="$(basename "$INPUT")"
+OUTPUT="$DIR/${NAME%.img}_magisk.img"
+
+BASE="$HOME/.local/share/magiskroot"
+APK="$BASE/magisk.apk"
+MAGISKBOOT="$BASE/tools/magiskboot"
+
+[[ -s "$APK" ]] || { echo "ERREUR: APK Magisk absent"; exit 1; }
+[[ -x "$MAGISKBOOT" ]] || { echo "ERREUR: magiskboot absent"; exit 1; }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+cd "$WORK"
+
+echo "[1/5] Preparation Magisk 31.1..."
+
+cp "$MAGISKBOOT" magiskboot
+
+extract() {
+    unzip -p "$APK" "$1" > "$2"
+    [[ -s "$2" ]] || {
+        echo "ERREUR: composant manquant: $1"
+        exit 1
+    }
+}
+
+extract assets/boot_patch.sh boot_patch.sh
+extract assets/util_functions.sh util_functions.sh
+extract lib/arm64-v8a/libmagisk.so magisk
+extract lib/arm64-v8a/libmagiskinit.so magiskinit
+extract lib/arm64-v8a/libinit-ld.so init-ld
+
+chmod 755 magiskboot magisk magiskinit init-ld
+
+echo "[2/5] Configuration..."
+
+# Mode non-Android : evite les appels au descripteur OUTFD.
+export BOOTMODE=false
+export OUTFD=1
+export KEEPVERITY=true
+export KEEPFORCEENCRYPT=true
+export PATCHVBMETAFLAG=false
+export RECOVERYMODE=false
+export LEGACYSAR=false
+export PREINITDEVICE=""
+
+unset SOURCEDMODE
+
+echo "[3/5] Patch Magisk..."
+bash ./boot_patch.sh "$INPUT"
+
+[[ -s new-boot.img ]] || {
+    echo "ERREUR: image patchee absente"
+    exit 1
+}
+
+echo "[4/5] Verification..."
+
+mkdir verify
+(
+    cd verify
+    ../magiskboot unpack ../new-boot.img
+
+    [[ -s ramdisk.cpio ]] || {
+        echo "ERREUR: ramdisk absent"
+        exit 1
+    }
+
+    ../magiskboot cpio ramdisk.cpio "ls -r" > ramdisk-list.txt
+
+    for entry in \
+        init \
+        overlay.d/sbin/magisk.xz \
+        overlay.d/sbin/init-ld.xz \
+        .backup/.magisk
+    do
+        grep -Fq "$entry" ramdisk-list.txt || {
+            echo "ERREUR: composant absent: $entry"
+            exit 1
+        }
+    done
+)
+
+echo "[5/5] Sauvegarde..."
+
+[[ ! -e "$OUTPUT" ]] || {
+    echo "ERREUR: le fichier existe deja: $OUTPUT"
+    exit 1
+}
+
+cp new-boot.img "$OUTPUT"
+
+echo
+echo "========================================"
+echo "PATCH MAGISK TERMINE"
+echo "Image: $OUTPUT"
+echo "Taille: $(du -h "$OUTPUT" | cut -f1)"
+echo "========================================"
